@@ -1,18 +1,13 @@
 #!/bin/bash
 # Ralph Wiggum: Before Shell Execution Hook
-# - Warns at 80% of threshold
-# - At 100%: ONLY allows git commands (add, commit, push, status)
-# - Blocks everything else to force agent to stop gracefully
+# - Uses EXTERNAL state (agent cannot tamper)
+# - At threshold: ONLY allows git commands
+# - Blocks everything else to force graceful stop
 
 set -euo pipefail
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-THRESHOLD=60000
-WARN_PERCENT=80
-WARN_THRESHOLD=$((THRESHOLD * WARN_PERCENT / 100))
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/ralph-common.sh"
 
 # =============================================================================
 # MAIN
@@ -25,74 +20,89 @@ HOOK_INPUT=$(cat)
 COMMAND=$(echo "$HOOK_INPUT" | jq -r '.command // ""')
 WORKSPACE_ROOT=$(echo "$HOOK_INPUT" | jq -r '.workspace_roots[0] // "."')
 
-RALPH_DIR="$WORKSPACE_ROOT/.ralph"
-CONTEXT_LOG="$RALPH_DIR/context-log.md"
-
-# If Ralph isn't active, pass through
-if [[ ! -d "$RALPH_DIR" ]]; then
+# Get external state directory (if Ralph is active)
+EXT_DIR=$(get_ralph_external_dir "$WORKSPACE_ROOT")
+if [[ ! -d "$EXT_DIR" ]]; then
   echo '{"permission": "allow"}'
   exit 0
 fi
 
 # =============================================================================
-# GET CURRENT CONTEXT USAGE
+# HARD TERMINATION CHECK
 # =============================================================================
 
-CURRENT_ALLOCATED=0
-if [[ -f "$CONTEXT_LOG" ]]; then
-  CURRENT_ALLOCATED=$(grep 'Allocated:' "$CONTEXT_LOG" | grep -o '[0-9]*' | head -1 || echo "0")
-  if [[ -z "$CURRENT_ALLOCATED" ]]; then
-    CURRENT_ALLOCATED=0
-  fi
-fi
-
-# =============================================================================
-# AT OR OVER 100% - ONLY ALLOW GIT COMMANDS
-# =============================================================================
-
-if [[ "$CURRENT_ALLOCATED" -ge "$THRESHOLD" ]]; then
-  
-  # Check if this is an allowed git command
-  # Allow: git add, git commit, git push, git status, git diff
-  if [[ "$COMMAND" =~ ^git[[:space:]]+(add|commit|push|status|diff) ]] || \
-     [[ "$COMMAND" =~ ^git$ ]]; then
-    
-    jq -n \
-      --arg cmd "$COMMAND" \
-      '{
-        "permission": "allow",
-        "agent_message": ("Git command allowed. After committing and pushing, you MUST stop working and end this conversation.")
-      }'
+if is_terminated "$EXT_DIR"; then
+  # Only allow git commands for final commit
+  if [[ "$COMMAND" =~ ^git[[:space:]]+(add|commit|push|status|diff) ]] || [[ "$COMMAND" =~ ^git$ ]]; then
+    jq -n '{
+      "permission": "allow",
+      "agent_message": "Git command allowed. After committing, this conversation MUST end."
+    }'
     exit 0
   fi
   
-  # Block everything else
   jq -n \
-    --argjson tokens "$CURRENT_ALLOCATED" \
-    --argjson threshold "$THRESHOLD" \
     --arg cmd "$COMMAND" \
     '{
       "permission": "deny",
-      "user_message": ("🛑 Ralph: Command blocked. Context limit reached (" + ($tokens|tostring) + "/" + ($threshold|tostring) + " tokens)."),
-      "agent_message": ("COMMAND BLOCKED: " + $cmd + "\n\nContext limit reached (" + ($tokens|tostring) + "/" + ($threshold|tostring) + " tokens).\n\nONLY git commands are allowed. You MUST:\n1. git add -A\n2. git commit -m \"checkpoint: context limit\"\n3. git push origin main\n4. STOP and end this conversation\n\nA Cloud Agent will continue with fresh context.")
+      "user_message": "🛑 Ralph: Conversation terminated. Only git commands allowed.",
+      "agent_message": ("BLOCKED: " + $cmd + "\n\nThis conversation is terminated. Only git add/commit/push allowed.\n\nCommit your work and END this conversation.")
     }'
   exit 0
 fi
 
 # =============================================================================
-# WARNING AT 80% (but still allow)
+# GET CURRENT CONTEXT STATE
 # =============================================================================
 
-if [[ "$CURRENT_ALLOCATED" -ge "$WARN_THRESHOLD" ]]; then
-  REMAINING=$((THRESHOLD - CURRENT_ALLOCATED))
-  PERCENT=$((CURRENT_ALLOCATED * 100 / THRESHOLD))
+TURN_COUNT=$(get_turn_count "$EXT_DIR")
+ESTIMATED_TOKENS=$((TURN_COUNT * TOKENS_PER_TURN))
+
+# =============================================================================
+# AT THRESHOLD - ONLY ALLOW GIT
+# =============================================================================
+
+if [[ "$ESTIMATED_TOKENS" -ge "$THRESHOLD" ]]; then
+  
+  # Set terminated flag
+  set_terminated "$EXT_DIR" "context_limit_shell"
+  
+  # Allow git commands
+  if [[ "$COMMAND" =~ ^git[[:space:]]+(add|commit|push|status|diff) ]] || [[ "$COMMAND" =~ ^git$ ]]; then
+    jq -n '{
+      "permission": "allow",
+      "agent_message": "Git command allowed. Context limit reached - commit and push, then STOP."
+    }'
+    exit 0
+  fi
+  
+  # Block everything else
+  jq -n \
+    --argjson tokens "$ESTIMATED_TOKENS" \
+    --argjson threshold "$THRESHOLD" \
+    --arg cmd "$COMMAND" \
+    '{
+      "permission": "deny",
+      "user_message": ("🛑 Ralph: Command blocked. Context limit reached."),
+      "agent_message": ("BLOCKED: " + $cmd + "\n\nContext limit reached (" + ($tokens|tostring) + "/" + ($threshold|tostring) + ").\n\nONLY git commands allowed. Commit and push your work, then STOP.")
+    }'
+  exit 0
+fi
+
+# =============================================================================
+# WARNING AT 80%
+# =============================================================================
+
+if [[ "$ESTIMATED_TOKENS" -ge "$WARN_THRESHOLD" ]]; then
+  REMAINING=$((THRESHOLD - ESTIMATED_TOKENS))
+  PERCENT=$((ESTIMATED_TOKENS * 100 / THRESHOLD))
   
   jq -n \
     --argjson percent "$PERCENT" \
     --argjson remaining "$REMAINING" \
     '{
       "permission": "allow",
-      "agent_message": ("Context at " + ($percent|tostring) + "%. " + ($remaining|tostring) + " tokens remaining. Work efficiently and commit frequently.")
+      "agent_message": ("⚠️ Context at " + ($percent|tostring) + "%. Complete task and commit soon.")
     }'
   exit 0
 fi

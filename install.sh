@@ -21,21 +21,37 @@ if ! git rev-parse --git-dir > /dev/null 2>&1; then
   echo ""
 fi
 
-# Create directories
+WORKSPACE_ROOT="$(pwd)"
+
+# =============================================================================
+# CREATE DIRECTORIES
+# =============================================================================
+
 echo "📁 Creating directories..."
 mkdir -p .cursor/ralph-scripts
 mkdir -p .ralph
 
-# Download scripts
+# Create external state directory
+WORKSPACE_HASH=$(echo -n "$WORKSPACE_ROOT" | shasum -a 256 | cut -c1-12)
+EXTERNAL_STATE_DIR="$HOME/.cursor/ralph/$WORKSPACE_HASH"
+mkdir -p "$EXTERNAL_STATE_DIR"
+echo "   External state: $EXTERNAL_STATE_DIR"
+
+# =============================================================================
+# DOWNLOAD SCRIPTS
+# =============================================================================
+
 echo "📥 Downloading Ralph scripts..."
 
 SCRIPTS=(
+  "ralph-common.sh"
   "before-prompt.sh"
   "before-read.sh"
   "before-shell.sh"
   "after-edit.sh"
   "stop-hook.sh"
   "spawn-cloud-agent.sh"
+  "test-cloud-api.sh"
 )
 
 for script in "${SCRIPTS[@]}"; do
@@ -45,9 +61,14 @@ done
 
 echo "✓ Scripts installed to .cursor/ralph-scripts/"
 
-# Download hooks.json and update paths
+# =============================================================================
+# DOWNLOAD AND CONFIGURE HOOKS
+# =============================================================================
+
 echo "📥 Downloading hooks configuration..."
 curl -fsSL "$REPO_RAW/hooks.json" -o ".cursor/hooks.json"
+
+# Update paths in hooks.json
 if [[ "$OSTYPE" == "darwin"* ]]; then
   sed -i '' 's|./scripts/|./.cursor/ralph-scripts/|g' .cursor/hooks.json
 else
@@ -55,78 +76,20 @@ else
 fi
 echo "✓ Hooks configured in .cursor/hooks.json"
 
-# Download SKILL.md
-echo "📥 Downloading skill definition..."
-curl -fsSL "$REPO_RAW/SKILL.md" -o ".cursor/SKILL.md"
-echo "✓ Skill definition saved to .cursor/SKILL.md"
-
 # =============================================================================
-# EXPLAIN THE TWO MODES
+# INITIALIZE EXTERNAL STATE
 # =============================================================================
 
-echo ""
-echo "Ralph has two modes for handling context (malloc/free):"
-echo ""
-echo "┌─────────────────────────────────────────────────────────────────┐"
-echo "│ 🌩️  CLOUD MODE (True Ralph)                                     │"
-echo "├─────────────────────────────────────────────────────────────────┤"
-echo "│ • Automatic fresh context via Cloud Agent API                  │"
-echo "│ • When context fills up, spawns new Cloud Agent automatically  │"
-echo "│ • True malloc/free cycle - fully autonomous                    │"
-echo "│ • Requires: Cursor API key + GitHub repository                 │"
-echo "└─────────────────────────────────────────────────────────────────┘"
-echo ""
-echo "┌─────────────────────────────────────────────────────────────────┐"
-echo "│ 💻 LOCAL MODE (Assisted Ralph)                                  │"
-echo "├─────────────────────────────────────────────────────────────────┤"
-echo "│ • Hooks detect when context is full                            │"
-echo "│ • Instructs YOU to start a new conversation                    │"
-echo "│ • Human-in-the-loop malloc/free cycle                          │"
-echo "│ • Works without API key, works with local repos                │"
-echo "└─────────────────────────────────────────────────────────────────┘"
-echo ""
-
-# =============================================================================
-# CLOUD MODE CONFIGURATION (optional)
-# =============================================================================
-
-CLOUD_ENABLED=false
-
-if [[ -n "${CURSOR_API_KEY:-}" ]]; then
-  echo "✓ Found CURSOR_API_KEY in environment - Cloud Mode enabled"
-  CLOUD_ENABLED=true
-elif [[ -f "$HOME/.cursor/ralph-config.json" ]]; then
-  EXISTING_KEY=$(jq -r '.cursor_api_key // empty' "$HOME/.cursor/ralph-config.json" 2>/dev/null || echo "")
-  if [[ -n "$EXISTING_KEY" ]]; then
-    echo "✓ Found API key in ~/.cursor/ralph-config.json - Cloud Mode enabled"
-    CLOUD_ENABLED=true
-  fi
-fi
-
-if [[ "$CLOUD_ENABLED" == "false" ]] && [[ -t 0 ]]; then
-  echo "To enable Cloud Mode, you can:"
-  echo "  1. Set environment variable: export CURSOR_API_KEY='your-key'"
-  echo "  2. Create ~/.cursor/ralph-config.json with your key"
-  echo ""
-  echo "Get your API key from: https://cursor.com/dashboard?tab=integrations"
-  echo ""
-  echo "Continuing with Local Mode for now..."
-fi
-
-# =============================================================================
-# INITIALIZE STATE FILES
-# =============================================================================
-
-echo ""
-echo "📁 Initializing .ralph/ state directory..."
+echo "📁 Initializing external state..."
 
 INIT_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # state.md
-cat > .ralph/state.md <<EOF
+cat > "$EXTERNAL_STATE_DIR/state.md" <<EOF
 ---
 iteration: 0
 status: initialized
+workspace: $WORKSPACE_ROOT
 started_at: $INIT_TIMESTAMP
 ---
 
@@ -136,52 +99,40 @@ Iteration 0 - Initialized, waiting for first prompt.
 EOF
 
 # context-log.md
-cat > .ralph/context-log.md <<EOF
-# Context Allocation Log (Hook-Managed)
+cat > "$EXTERNAL_STATE_DIR/context-log.md" <<EOF
+# Context Allocation Log (External State)
 
-> ⚠️ This file is managed by hooks. Do not edit manually.
+> This file is managed by hooks. Stored outside workspace to prevent tampering.
 
 ## Current Session
 
-| File | Size (est tokens) | Timestamp |
-|------|-------------------|-----------|
-
-## Estimated Context Usage
-
-- Allocated: 0 tokens
-- Threshold: 60000 tokens (warn at 80%)
+- Turn count: 0
+- Estimated tokens: 0
+- Threshold: 60000 tokens
 - Status: 🟢 Healthy
 
+## Activity Log
+
+| Turn | Tokens | Timestamp |
+|------|--------|-----------|
 EOF
 
-# edits.log
-cat > .ralph/edits.log <<EOF
-# Edit Log (Hook-Managed)
-# This file is append-only. Do not edit manually.
-# Format: TIMESTAMP | FILE | CHANGE_TYPE | CHARS | ITERATION
+# progress.md
+cat > "$EXTERNAL_STATE_DIR/progress.md" <<EOF
+# Progress Log
 
-EOF
+> External state - survives context resets.
+> Workspace: $WORKSPACE_ROOT
 
-# failures.md
-cat > .ralph/failures.md <<EOF
-# Failure Log (Hook-Managed)
+---
 
-## Pattern Detection
-
-- Repeated failures: 0
-- Gutter risk: Low
-
-## Recent Failures
-
-(Failures will be logged here by hooks)
+## Iteration History
 
 EOF
 
 # guardrails.md
-cat > .ralph/guardrails.md <<EOF
+cat > "$EXTERNAL_STATE_DIR/guardrails.md" <<EOF
 # Ralph Guardrails (Signs)
-
-These are lessons learned from iterations. Follow these to avoid known pitfalls.
 
 ## Core Signs
 
@@ -192,7 +143,7 @@ These are lessons learned from iterations. Follow these to avoid known pitfalls.
 - Run tests after every significant change
 
 ### Sign: Commit Checkpoints
-- Commit working states before attempting risky changes
+- Commit working states before risky changes
 
 ### Sign: One Thing at a Time
 - Focus on one criterion at a time
@@ -201,16 +152,42 @@ These are lessons learned from iterations. Follow these to avoid known pitfalls.
 
 ## Learned Signs
 
-(Signs added from observed failures will appear below)
+EOF
+
+# failures.md
+cat > "$EXTERNAL_STATE_DIR/failures.md" <<EOF
+# Failure Log
+
+## Pattern Detection
+
+- Repeated failures: 0
+- Gutter risk: Low
+
+## Recent Failures
 
 EOF
 
-# progress.md - incremental, hooks append checkpoints
+# edits.log
+cat > "$EXTERNAL_STATE_DIR/edits.log" <<EOF
+# Edit Log (External State)
+# Format: TIMESTAMP | FILE | CHANGE_TYPE | CHARS | ITERATION
+
+EOF
+
+echo "✓ External state initialized at $EXTERNAL_STATE_DIR"
+
+# =============================================================================
+# INITIALIZE IN-WORKSPACE STATE (for Cloud Agents)
+# =============================================================================
+
+echo "📁 Initializing .ralph/ (synced for Cloud Agents)..."
+
+# These files are synced from external state and committed for cloud agents
 cat > .ralph/progress.md <<EOF
 # Progress Log
 
-> This file tracks incremental progress. Hooks append checkpoints automatically.
-> You can also add your own notes and summaries here.
+> This file is synced from external state for Cloud Agent access.
+> Workspace: $WORKSPACE_ROOT
 
 ---
 
@@ -218,7 +195,40 @@ cat > .ralph/progress.md <<EOF
 
 EOF
 
-echo "✓ State files created in .ralph/"
+cat > .ralph/guardrails.md <<EOF
+# Ralph Guardrails (Signs)
+
+## Core Signs
+
+### Sign: Read Before Writing
+- **Always** read existing files before modifying them
+
+### Sign: Test After Changes
+- Run tests after every significant change
+
+### Sign: Commit Checkpoints
+- Commit working states before risky changes
+
+### Sign: One Thing at a Time
+- Focus on one criterion at a time
+
+---
+
+## Learned Signs
+
+EOF
+
+cat > .ralph/README.md <<EOF
+# Ralph State Files
+
+These files are synced from external state for Cloud Agent access.
+The authoritative state is stored outside the workspace at:
+  ~/.cursor/ralph/$WORKSPACE_HASH/
+
+Do not edit these files directly - they will be overwritten during sync.
+EOF
+
+echo "✓ .ralph/ initialized"
 
 # =============================================================================
 # CREATE RALPH_TASK.md TEMPLATE
@@ -226,9 +236,10 @@ echo "✓ State files created in .ralph/"
 
 if [[ ! -f "RALPH_TASK.md" ]]; then
   echo "📝 Creating RALPH_TASK.md template..."
-  cat > RALPH_TASK.md <<'EOF'
+  cat > RALPH_TASK.md <<'TASKEOF'
 ---
 task: Build a CLI todo app in TypeScript
+test_command: "npx ts-node todo.ts list"
 completion_criteria:
   - Can add todos
   - Can list todos
@@ -275,15 +286,14 @@ $ npx ts-node todo.ts done 1
 
 ## Ralph Instructions
 
-1. Read `.ralph/progress.md` to see what's been done
-2. Check `.ralph/guardrails.md` for signs to follow
-3. Work on the next incomplete criterion (marked [ ])
-4. Check off completed criteria (change [ ] to [x])
-5. Commit your changes with descriptive messages
-6. When ALL criteria are [x], say: `RALPH_COMPLETE: All criteria satisfied`
-7. If stuck on the same issue 3+ times, say: `RALPH_GUTTER: Need fresh context`
-EOF
-  echo "✓ Created RALPH_TASK.md with TypeScript example task"
+1. Work on the next incomplete criterion (marked [ ])
+2. Check off completed criteria (change [ ] to [x])
+3. Run tests after changes
+4. Commit your changes frequently
+5. When ALL criteria are [x], say: `RALPH_COMPLETE`
+6. If stuck on the same issue 3+ times, say: `RALPH_GUTTER`
+TASKEOF
+  echo "✓ Created RALPH_TASK.md with example task"
 else
   echo "✓ RALPH_TASK.md already exists (not overwritten)"
 fi
@@ -307,6 +317,23 @@ fi
 echo "✓ Updated .gitignore"
 
 # =============================================================================
+# CLOUD MODE CHECK
+# =============================================================================
+
+CLOUD_ENABLED=false
+
+if [[ -n "${CURSOR_API_KEY:-}" ]]; then
+  echo "✓ Found CURSOR_API_KEY in environment - Cloud Mode enabled"
+  CLOUD_ENABLED=true
+elif [[ -f "$HOME/.cursor/ralph-config.json" ]]; then
+  EXISTING_KEY=$(jq -r '.cursor_api_key // empty' "$HOME/.cursor/ralph-config.json" 2>/dev/null || echo "")
+  if [[ -n "$EXISTING_KEY" ]]; then
+    echo "✓ Found API key in ~/.cursor/ralph-config.json - Cloud Mode enabled"
+    CLOUD_ENABLED=true
+  fi
+fi
+
+# =============================================================================
 # SUMMARY
 # =============================================================================
 
@@ -318,34 +345,35 @@ echo ""
 echo "Files created:"
 echo ""
 echo "  📁 .cursor/"
-echo "     ├── hooks.json           - Cursor hooks configuration"
-echo "     ├── ralph-scripts/       - Hook scripts"
-echo "     └── SKILL.md             - Skill definition"
+echo "     ├── hooks.json              - Cursor hooks configuration"
+echo "     └── ralph-scripts/          - Hook scripts"
 echo ""
-echo "  📁 .ralph/"
-echo "     ├── state.md             - Current iteration"
-echo "     ├── progress.md          - Incremental checkpoints"
-echo "     ├── context-log.md       - Context (malloc) tracking"
-echo "     ├── edits.log            - Raw edit history"
-echo "     ├── failures.md          - Failure patterns"
-echo "     └── guardrails.md        - Signs to follow"
+echo "  📁 .ralph/                     - Synced state (for Cloud Agents)"
+echo "     ├── progress.md"
+echo "     └── guardrails.md"
 echo ""
-echo "  📄 RALPH_TASK.md            - Your task definition (edit this!)"
+echo "  📁 ~/.cursor/ralph/$WORKSPACE_HASH/"
+echo "     └── (external state - tamper-proof)"
+echo ""
+echo "  📄 RALPH_TASK.md               - Your task definition (edit this!)"
 echo ""
 echo "Next steps:"
 echo "  1. Edit RALPH_TASK.md to define your actual task"
-echo "  2. Open this folder in Cursor"
+echo "  2. Restart Cursor (to load hooks)"
 echo "  3. Start a new conversation"
 echo "  4. Say: \"Work on the Ralph task in RALPH_TASK.md\""
 echo ""
 if [[ "$CLOUD_ENABLED" == "true" ]]; then
-  echo "Mode: 🌩️  Cloud (automatic context management)"
+  echo "Mode: 🌩️  Cloud (automatic context handoff)"
 else
   echo "Mode: 💻 Local (you'll be prompted to start new conversations)"
   echo ""
   echo "To enable Cloud Mode:"
   echo "  export CURSOR_API_KEY='your-key-from-cursor-dashboard'"
+  echo "  # or"
+  echo "  echo '{\"cursor_api_key\": \"your-key\"}' > ~/.cursor/ralph-config.json"
 fi
 echo ""
+echo "Test Cloud API: ./.cursor/ralph-scripts/test-cloud-api.sh"
 echo "Learn more: https://ghuntley.com/ralph/"
 echo "═══════════════════════════════════════════════════════════════════"

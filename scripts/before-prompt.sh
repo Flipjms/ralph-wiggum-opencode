@@ -1,30 +1,13 @@
 #!/bin/bash
 # Ralph Wiggum: Before Prompt Hook
-# - Updates iteration count
-# - Injects context into agent
-# - BLOCKS next prompt if context limit reached (continue: false)
+# - Uses EXTERNAL state (agent cannot tamper)
+# - Turn-based context tracking (more reliable than file reads)
+# - Hard termination check (blocks if terminated flag set)
 
 set -euo pipefail
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-THRESHOLD=60000
-WARN_PERCENT=80
-WARN_THRESHOLD=$((THRESHOLD * WARN_PERCENT / 100))
-
-# =============================================================================
-# HELPERS
-# =============================================================================
-
-sedi() {
-  if [[ "$OSTYPE" == "darwin"* ]]; then
-    sed -i '' "$@"
-  else
-    sed -i "$@"
-  fi
-}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/ralph-common.sh"
 
 # =============================================================================
 # MAIN
@@ -37,178 +20,105 @@ HOOK_INPUT=$(cat)
 WORKSPACE_ROOT=$(echo "$HOOK_INPUT" | jq -r '.workspace_roots[0] // .cwd // "."')
 
 if [[ "$WORKSPACE_ROOT" == "." ]] || [[ -z "$WORKSPACE_ROOT" ]]; then
+  # Try to find RALPH_TASK.md
   if [[ -f "./RALPH_TASK.md" ]]; then
-    WORKSPACE_ROOT="."
+    WORKSPACE_ROOT="$(pwd)"
   else
     echo '{}'
     exit 0
   fi
 fi
 
-RALPH_DIR="$WORKSPACE_ROOT/.ralph"
 TASK_FILE="$WORKSPACE_ROOT/RALPH_TASK.md"
-STATE_FILE="$RALPH_DIR/state.md"
-PROGRESS_FILE="$RALPH_DIR/progress.md"
-GUARDRAILS_FILE="$RALPH_DIR/guardrails.md"
-CONTEXT_LOG="$RALPH_DIR/context-log.md"
 
-# Check if Ralph is active
+# Check if Ralph is active (task file exists)
 if [[ ! -f "$TASK_FILE" ]]; then
   echo '{}'
   exit 0
 fi
 
-# Initialize Ralph state directory if needed
-if [[ ! -d "$RALPH_DIR" ]]; then
-  mkdir -p "$RALPH_DIR"
+# =============================================================================
+# EXTERNAL STATE INITIALIZATION
+# =============================================================================
+
+EXT_DIR=$(init_external_state "$WORKSPACE_ROOT")
+
+# =============================================================================
+# HARD TERMINATION CHECK
+# =============================================================================
+
+if is_terminated "$EXT_DIR"; then
+  REASON=$(cat "$EXT_DIR/.terminated" 2>/dev/null || echo "unknown")
+  CURRENT_ITER=$(get_iteration "$EXT_DIR")
   
-  cat > "$STATE_FILE" <<EOF
----
-iteration: 0
-status: initialized
-started_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
----
-
-# Ralph State
-
-Iteration 0 - Initialized, waiting for first prompt.
-EOF
-
-  cat > "$GUARDRAILS_FILE" <<EOF
-# Ralph Guardrails (Signs)
-
-## Core Signs
-
-### Sign: Read Before Writing
-- **Always** read existing files before modifying them
-
-### Sign: Test After Changes
-- Run tests after every significant change
-- Task is NOT complete until tests pass
-
-### Sign: Commit Checkpoints
-- Commit working states before risky changes
-
-### Sign: One Thing at a Time
-- Focus on one criterion at a time
-
----
-
-## Learned Signs
-
-EOF
-
-  cat > "$CONTEXT_LOG" <<EOF
-# Context Allocation Log (Hook-Managed)
-
-> ⚠️ This file is managed by hooks. Do not edit manually.
-
-## Current Session
-
-| File | Size (est tokens) | Timestamp |
-|------|-------------------|-----------|
-
-## Estimated Context Usage
-
-- Allocated: 0 tokens
-- Threshold: $THRESHOLD tokens (warn at 80%)
-- Status: 🟢 Healthy
-
-EOF
-
-  cat > "$RALPH_DIR/edits.log" <<EOF
-# Edit Log (Hook-Managed)
-# Format: TIMESTAMP | FILE | CHANGE_TYPE | CHARS | ITERATION
-
-EOF
-
-  cat > "$RALPH_DIR/failures.md" <<EOF
-# Failure Log (Hook-Managed)
-
-## Pattern Detection
-
-- Repeated failures: 0
-- Gutter risk: Low
-
-## Recent Failures
-
-EOF
-
-  cat > "$PROGRESS_FILE" <<EOF
-# Progress Log
-
----
-
-## Iteration History
-
-EOF
-fi
-
-# =============================================================================
-# GET CURRENT STATE
-# =============================================================================
-
-CURRENT_ITERATION=$(grep '^iteration:' "$STATE_FILE" 2>/dev/null | sed 's/iteration: *//' || echo "0")
-TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-# Get context usage
-ALLOCATED_TOKENS=0
-if [[ -f "$CONTEXT_LOG" ]]; then
-  ALLOCATED_TOKENS=$(grep 'Allocated:' "$CONTEXT_LOG" | grep -o '[0-9]*' | head -1 || echo "0")
-  if [[ -z "$ALLOCATED_TOKENS" ]]; then
-    ALLOCATED_TOKENS=0
-  fi
-fi
-
-# =============================================================================
-# BLOCK IF CONTEXT LIMIT REACHED
-# =============================================================================
-
-if [[ "$ALLOCATED_TOKENS" -ge "$THRESHOLD" ]]; then
   jq -n \
-    --argjson tokens "$ALLOCATED_TOKENS" \
-    --argjson threshold "$THRESHOLD" \
-    --argjson iter "$CURRENT_ITERATION" \
+    --argjson iter "$CURRENT_ITER" \
+    --arg reason "$REASON" \
     '{
       "continue": false,
-      "user_message": ("🛑 Ralph: Context limit reached (" + ($tokens|tostring) + "/" + ($threshold|tostring) + " tokens). This conversation cannot continue. A Cloud Agent will be spawned or start a new conversation: \"Continue Ralph from iteration " + ($iter|tostring) + "\"")
+      "user_message": ("🛑 Ralph: Conversation terminated (" + $reason + "). Start a NEW conversation: \"Continue Ralph from iteration " + ($iter|tostring) + "\"")
     }'
   exit 0
 fi
 
 # =============================================================================
-# UPDATE ITERATION
+# INCREMENT TURN AND CHECK CONTEXT
 # =============================================================================
 
-NEXT_ITERATION=$((CURRENT_ITERATION + 1))
+CURRENT_ITER=$(get_iteration "$EXT_DIR")
+ESTIMATED_TOKENS=$(increment_turn "$EXT_DIR")
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-cat > "$STATE_FILE" <<EOF
+# Log the turn
+echo "| $(($(get_turn_count "$EXT_DIR"))) | $ESTIMATED_TOKENS | $TIMESTAMP |" >> "$EXT_DIR/context-log.md"
+
+# =============================================================================
+# BLOCK IF CONTEXT LIMIT REACHED
+# =============================================================================
+
+if [[ "$ESTIMATED_TOKENS" -ge "$THRESHOLD" ]]; then
+  # Set terminated flag BEFORE responding
+  set_terminated "$EXT_DIR" "context_limit_$ESTIMATED_TOKENS"
+  
+  NEXT_ITER=$((CURRENT_ITER + 1))
+  
+  jq -n \
+    --argjson tokens "$ESTIMATED_TOKENS" \
+    --argjson threshold "$THRESHOLD" \
+    --argjson iter "$NEXT_ITER" \
+    '{
+      "continue": false,
+      "user_message": ("🛑 Ralph: Context limit reached (" + ($tokens|tostring) + "/" + ($threshold|tostring) + " tokens). Cloud Agent will be spawned. If not, start NEW conversation: \"Continue Ralph from iteration " + ($iter|tostring) + "\"")
+    }'
+  exit 0
+fi
+
+# =============================================================================
+# INCREMENT ITERATION ON FIRST TURN OF SESSION
+# =============================================================================
+
+TURN_COUNT=$(get_turn_count "$EXT_DIR")
+if [[ "$TURN_COUNT" -eq 1 ]]; then
+  # First turn of this session - increment iteration
+  CURRENT_ITER=$(increment_iteration "$EXT_DIR")
+  
+  # Log to progress
+  cat >> "$EXT_DIR/progress.md" <<EOF
+
 ---
-iteration: $NEXT_ITERATION
-status: active
-started_at: $TIMESTAMP
----
 
-# Ralph State
-
-Iteration $NEXT_ITERATION - Active
-EOF
-
-# Add iteration marker to progress
-cat >> "$PROGRESS_FILE" <<EOF
-
----
-
-### 🔄 Iteration $NEXT_ITERATION Started
+### 🔄 Iteration $CURRENT_ITER Started
 **Time:** $TIMESTAMP
+**Workspace:** $WORKSPACE_ROOT
 
 EOF
+fi
 
 # =============================================================================
 # BUILD AGENT MESSAGE
 # =============================================================================
 
-# Get test command
+# Get test command from task file
 TEST_COMMAND=""
 if grep -q "^test_command:" "$TASK_FILE" 2>/dev/null; then
   TEST_COMMAND=$(grep "^test_command:" "$TASK_FILE" | sed 's/test_command: *//' | sed 's/^["'"'"']//' | sed 's/["'"'"']$//' | xargs)
@@ -216,26 +126,26 @@ fi
 
 # Get guardrails
 GUARDRAILS=""
-if [[ -f "$GUARDRAILS_FILE" ]]; then
-  GUARDRAILS=$(sed -n '/## Learned Signs/,$ p' "$GUARDRAILS_FILE" | tail -n +3)
+if [[ -f "$EXT_DIR/guardrails.md" ]]; then
+  GUARDRAILS=$(sed -n '/## Learned Signs/,$ p' "$EXT_DIR/guardrails.md" | tail -n +3)
 fi
 
-# Get last test output if exists
+# Get last test output
 LAST_TEST_OUTPUT=""
-if [[ -f "$RALPH_DIR/.last_test_output" ]]; then
-  LAST_TEST_OUTPUT=$(head -30 "$RALPH_DIR/.last_test_output")
+if [[ -f "$EXT_DIR/.last_test_output" ]]; then
+  LAST_TEST_OUTPUT=$(head -30 "$EXT_DIR/.last_test_output")
 fi
 
 # Build context warning if needed
 CONTEXT_WARNING=""
-if [[ "$ALLOCATED_TOKENS" -ge "$WARN_THRESHOLD" ]]; then
-  REMAINING=$((THRESHOLD - ALLOCATED_TOKENS))
-  PERCENT=$((ALLOCATED_TOKENS * 100 / THRESHOLD))
-  CONTEXT_WARNING="⚠️ **CONTEXT WARNING**: ${PERCENT}% used (${ALLOCATED_TOKENS}/${THRESHOLD} tokens). ${REMAINING} remaining. Work efficiently!"
+if [[ "$ESTIMATED_TOKENS" -ge "$WARN_THRESHOLD" ]]; then
+  REMAINING=$((THRESHOLD - ESTIMATED_TOKENS))
+  PERCENT=$((ESTIMATED_TOKENS * 100 / THRESHOLD))
+  CONTEXT_WARNING="⚠️ **CONTEXT WARNING**: ${PERCENT}% used (~${ESTIMATED_TOKENS}/${THRESHOLD} tokens). Work efficiently - context limit approaching!"
 fi
 
 # Build the message
-AGENT_MSG="🔄 **Ralph Iteration $NEXT_ITERATION**
+AGENT_MSG="🔄 **Ralph Iteration $CURRENT_ITER** (Turn $TURN_COUNT)
 
 $CONTEXT_WARNING
 
@@ -243,8 +153,8 @@ $CONTEXT_WARNING
 Read RALPH_TASK.md for the task description and completion criteria.
 
 ## Key Files
-- \`.ralph/progress.md\` - What's been done
-- \`.ralph/guardrails.md\` - Signs to follow"
+- \`RALPH_TASK.md\` - Task definition and checklist
+- Check off completed criteria with [x]"
 
 if [[ -n "$TEST_COMMAND" ]]; then
   AGENT_MSG="$AGENT_MSG
@@ -252,7 +162,7 @@ if [[ -n "$TEST_COMMAND" ]]; then
 ## ⚠️ Test-Driven Completion
 **Test command:** \`$TEST_COMMAND\`
 
-Run tests after making changes. Task is NOT complete until tests pass."
+Run tests after changes. Task is NOT complete until tests pass."
 
   if [[ -n "$LAST_TEST_OUTPUT" ]]; then
     AGENT_MSG="$AGENT_MSG
@@ -267,12 +177,11 @@ fi
 AGENT_MSG="$AGENT_MSG
 
 ## Ralph Protocol
-1. Read progress.md to see what's done
-2. Work on the next unchecked criterion
-3. Run tests after changes
-4. Check off completed criteria
-5. Commit frequently
-6. When ALL criteria pass tests: \`RALPH_COMPLETE\`
+1. Work on the next unchecked criterion
+2. Run tests after changes
+3. Check off completed criteria [x]
+4. Commit frequently
+5. When ALL criteria pass tests: say \`RALPH_COMPLETE\`
 
 $GUARDRAILS"
 

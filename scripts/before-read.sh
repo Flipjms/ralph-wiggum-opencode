@@ -1,35 +1,13 @@
 #!/bin/bash
 # Ralph Wiggum: Before Read File Hook
-# - Tracks context allocations
-# - Warns at 80% of threshold
-# - DENIES file reads at 100% threshold (forces agent to stop and commit)
+# - Uses EXTERNAL state (agent cannot tamper)
+# - Supplementary tracking (turn-based is primary)
+# - Logs file reads for observability
 
 set -euo pipefail
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-# Context threshold (lowered to 60k for easier testing)
-THRESHOLD=60000
-WARN_PERCENT=80
-WARN_THRESHOLD=$((THRESHOLD * WARN_PERCENT / 100))
-
-# Token multiplier: file reads/edits are ~25% of total context
-# (agent responses, tool calls, system prompts make up the rest)
-TOKEN_MULTIPLIER=4
-
-# =============================================================================
-# HELPERS
-# =============================================================================
-
-sedi() {
-  if [[ "$OSTYPE" == "darwin"* ]]; then
-    sed -i '' "$@"
-  else
-    sed -i "$@"
-  fi
-}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/ralph-common.sh"
 
 # =============================================================================
 # MAIN
@@ -40,109 +18,71 @@ HOOK_INPUT=$(cat)
 
 # Extract file info
 FILE_PATH=$(echo "$HOOK_INPUT" | jq -r '.file_path // .path // ""')
-CONTENT=$(echo "$HOOK_INPUT" | jq -r '.content // .file_content // ""')
 WORKSPACE_ROOT=$(echo "$HOOK_INPUT" | jq -r '.workspace_roots[0] // "."')
 
-RALPH_DIR="$WORKSPACE_ROOT/.ralph"
-CONTEXT_LOG="$RALPH_DIR/context-log.md"
-
-# If Ralph isn't active, pass through
-if [[ ! -d "$RALPH_DIR" ]]; then
+# Get external state directory (if Ralph is active)
+EXT_DIR=$(get_ralph_external_dir "$WORKSPACE_ROOT")
+if [[ ! -d "$EXT_DIR" ]]; then
   echo '{"permission": "allow"}'
   exit 0
 fi
 
 # =============================================================================
-# GET CURRENT CONTEXT USAGE
+# HARD TERMINATION CHECK
 # =============================================================================
 
-CURRENT_ALLOCATED=0
-if [[ -f "$CONTEXT_LOG" ]]; then
-  CURRENT_ALLOCATED=$(grep 'Allocated:' "$CONTEXT_LOG" | grep -o '[0-9]*' | head -1 || echo "0")
-  if [[ -z "$CURRENT_ALLOCATED" ]]; then
-    CURRENT_ALLOCATED=0
-  fi
-fi
-
-# =============================================================================
-# CHECK THRESHOLDS BEFORE ALLOWING READ
-# =============================================================================
-
-# AT OR OVER 100% - DENY (except we can't block, so just deny reads)
-if [[ "$CURRENT_ALLOCATED" -ge "$THRESHOLD" ]]; then
+if is_terminated "$EXT_DIR"; then
+  CURRENT_ITER=$(get_iteration "$EXT_DIR")
+  
   jq -n \
-    --argjson tokens "$CURRENT_ALLOCATED" \
-    --argjson threshold "$THRESHOLD" \
+    --argjson iter "$CURRENT_ITER" \
     '{
       "permission": "deny",
-      "user_message": ("🛑 Ralph: Context limit reached (" + ($tokens|tostring) + "/" + ($threshold|tostring) + " tokens). Agent must commit and stop."),
-      "agent_message": ("STOP IMMEDIATELY. Context limit reached (" + ($tokens|tostring) + "/" + ($threshold|tostring) + " tokens).\n\nYou MUST:\n1. Run: git add -A && git commit -m \"checkpoint: context limit reached\"\n2. Run: git push origin main\n3. STOP working and end this conversation.\n\nA Cloud Agent will continue your work with fresh context. Do NOT attempt any other operations.")
+      "user_message": ("🛑 Ralph: Conversation terminated. Start a NEW conversation."),
+      "agent_message": ("STOP. This conversation has been terminated due to context limits. You cannot continue.\n\nStart a NEW conversation with: \"Continue Ralph from iteration " + ($iter|tostring) + "\"")
     }'
   exit 0
 fi
 
 # =============================================================================
-# TRACK CONTEXT ALLOCATION (if under threshold)
+# GET CURRENT CONTEXT STATE
 # =============================================================================
 
-# Estimate token count for this file
-if [[ -n "$CONTENT" ]]; then
-  CONTENT_LENGTH=${#CONTENT}
-  RAW_TOKENS=$((CONTENT_LENGTH / 4))
-elif [[ -f "$FILE_PATH" ]]; then
-  FILE_SIZE=$(wc -c < "$FILE_PATH" 2>/dev/null || echo "0")
-  RAW_TOKENS=$((FILE_SIZE / 4))
-else
-  RAW_TOKENS=100
-fi
-
-ESTIMATED_TOKENS=$((RAW_TOKENS * TOKEN_MULTIPLIER))
-TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-# Update context log
-if [[ -f "$CONTEXT_LOG" ]]; then
-  NEW_ALLOCATED=$((CURRENT_ALLOCATED + ESTIMATED_TOKENS))
-  
-  sedi "s/Allocated: [0-9]* tokens/Allocated: $NEW_ALLOCATED tokens/" "$CONTEXT_LOG"
-  
-  # Update status indicator
-  if [[ "$NEW_ALLOCATED" -ge "$THRESHOLD" ]]; then
-    sedi "s/Status: .*/Status: 🔴 LIMIT REACHED - Must stop!/" "$CONTEXT_LOG"
-  elif [[ "$NEW_ALLOCATED" -ge "$WARN_THRESHOLD" ]]; then
-    sedi "s/Status: .*/Status: 🟡 Warning - Approaching limit/" "$CONTEXT_LOG"
-  fi
-  
-  # Log this file read
-  TEMP_FILE=$(mktemp)
-  awk -v file="$FILE_PATH" -v tokens="$ESTIMATED_TOKENS" -v ts="$TIMESTAMP" '
-    /^## Estimated Context Usage/ {
-      print "| " file " | " tokens " | " ts " |"
-      print ""
-    }
-    { print }
-  ' "$CONTEXT_LOG" > "$TEMP_FILE"
-  mv "$TEMP_FILE" "$CONTEXT_LOG"
-  
-  CURRENT_ALLOCATED=$NEW_ALLOCATED
-fi
+TURN_COUNT=$(get_turn_count "$EXT_DIR")
+ESTIMATED_TOKENS=$((TURN_COUNT * TOKENS_PER_TURN))
 
 # =============================================================================
-# WARNING AT 80% (but still allow)
+# HARD BLOCK AT THRESHOLD
 # =============================================================================
 
-if [[ "$CURRENT_ALLOCATED" -ge "$WARN_THRESHOLD" ]]; then
-  REMAINING=$((THRESHOLD - CURRENT_ALLOCATED))
-  PERCENT=$((CURRENT_ALLOCATED * 100 / THRESHOLD))
+if [[ "$ESTIMATED_TOKENS" -ge "$THRESHOLD" ]]; then
+  set_terminated "$EXT_DIR" "context_limit_file_read"
   
   jq -n \
-    --argjson tokens "$CURRENT_ALLOCATED" \
+    --argjson tokens "$ESTIMATED_TOKENS" \
     --argjson threshold "$THRESHOLD" \
-    --argjson remaining "$REMAINING" \
+    '{
+      "permission": "deny",
+      "user_message": ("🛑 Ralph: Context limit reached. File read blocked."),
+      "agent_message": ("STOP. Context limit reached (" + ($tokens|tostring) + "/" + ($threshold|tostring) + " tokens).\n\nYou MUST commit your work and end this conversation. A Cloud Agent will continue.")
+    }'
+  exit 0
+fi
+
+# =============================================================================
+# WARNING AT 80%
+# =============================================================================
+
+if [[ "$ESTIMATED_TOKENS" -ge "$WARN_THRESHOLD" ]]; then
+  REMAINING=$((THRESHOLD - ESTIMATED_TOKENS))
+  PERCENT=$((ESTIMATED_TOKENS * 100 / THRESHOLD))
+  
+  jq -n \
     --argjson percent "$PERCENT" \
+    --argjson remaining "$REMAINING" \
     '{
       "permission": "allow",
-      "user_message": ("⚠️ Ralph: Context at " + ($percent|tostring) + "% (" + ($tokens|tostring) + "/" + ($threshold|tostring) + " tokens). " + ($remaining|tostring) + " remaining."),
-      "agent_message": ("WARNING: Context at " + ($percent|tostring) + "% (" + ($tokens|tostring) + "/" + ($threshold|tostring) + " tokens).\n\nYou have " + ($remaining|tostring) + " tokens remaining. Work efficiently:\n- Complete your current task quickly\n- Commit frequently with descriptive messages\n- Prepare to hand off to a fresh context soon")
+      "agent_message": ("⚠️ Context at " + ($percent|tostring) + "%. ~" + ($remaining|tostring) + " tokens remaining. Complete current task and commit.")
     }'
   exit 0
 fi

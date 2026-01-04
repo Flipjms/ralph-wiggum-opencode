@@ -1,33 +1,16 @@
 #!/bin/bash
 # Ralph Wiggum: Stop Hook
-# - Runs when agent stops (completed, aborted, or error)
+# - Uses EXTERNAL state (agent cannot tamper)
 # - Forces commit of any uncommitted work
 # - Spawns Cloud Agent if context limit was reached
-# - Verifies completion via tests
+# - Sets terminated flag to block further prompts
 #
 # Core Ralph principle: Tests determine completion, not the agent.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-THRESHOLD=60000
-
-# =============================================================================
-# HELPERS
-# =============================================================================
-
-sedi() {
-  if [[ "$OSTYPE" == "darwin"* ]]; then
-    sed -i '' "$@"
-  else
-    sed -i "$@"
-  fi
-}
+source "$SCRIPT_DIR/ralph-common.sh"
 
 # =============================================================================
 # MAIN
@@ -39,17 +22,19 @@ HOOK_INPUT=$(cat)
 # Extract info
 WORKSPACE_ROOT=$(echo "$HOOK_INPUT" | jq -r '.workspace_roots[0] // "."')
 STOP_STATUS=$(echo "$HOOK_INPUT" | jq -r '.status // "unknown"')
+LOOP_COUNT=$(echo "$HOOK_INPUT" | jq -r '.loop_count // 0')
 
-RALPH_DIR="$WORKSPACE_ROOT/.ralph"
-STATE_FILE="$RALPH_DIR/state.md"
 TASK_FILE="$WORKSPACE_ROOT/RALPH_TASK.md"
-PROGRESS_FILE="$RALPH_DIR/progress.md"
-FAILURES_FILE="$RALPH_DIR/failures.md"
-CONTEXT_LOG="$RALPH_DIR/context-log.md"
-CONFIG_FILE="$WORKSPACE_ROOT/.cursor/ralph-config.json"
 
 # If Ralph isn't active, allow exit
-if [[ ! -f "$TASK_FILE" ]] || [[ ! -d "$RALPH_DIR" ]]; then
+if [[ ! -f "$TASK_FILE" ]]; then
+  echo '{}'
+  exit 0
+fi
+
+# Get external state directory
+EXT_DIR=$(get_ralph_external_dir "$WORKSPACE_ROOT")
+if [[ ! -d "$EXT_DIR" ]]; then
   echo '{}'
   exit 0
 fi
@@ -58,18 +43,11 @@ fi
 # GET CURRENT STATE
 # =============================================================================
 
-CURRENT_ITERATION=$(grep '^iteration:' "$STATE_FILE" 2>/dev/null | sed 's/iteration: *//' || echo "0")
+CURRENT_ITERATION=$(get_iteration "$EXT_DIR")
+TURN_COUNT=$(get_turn_count "$EXT_DIR")
+ESTIMATED_TOKENS=$((TURN_COUNT * TOKENS_PER_TURN))
 UNCHECKED_CRITERIA=$(grep -c '\- \[ \]' "$TASK_FILE" 2>/dev/null || echo "0")
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-# Get context usage
-ALLOCATED_TOKENS=0
-if [[ -f "$CONTEXT_LOG" ]]; then
-  ALLOCATED_TOKENS=$(grep 'Allocated:' "$CONTEXT_LOG" | grep -o '[0-9]*' | head -1 || echo "0")
-  if [[ -z "$ALLOCATED_TOKENS" ]]; then
-    ALLOCATED_TOKENS=0
-  fi
-fi
 
 # Get test command
 TEST_COMMAND=""
@@ -81,24 +59,29 @@ fi
 # CLOUD MODE CHECK
 # =============================================================================
 
-is_cloud_enabled() {
+get_api_key() {
   if [[ -n "${CURSOR_API_KEY:-}" ]]; then
+    echo "$CURSOR_API_KEY"
     return 0
   fi
-  if [[ -f "$CONFIG_FILE" ]]; then
-    KEY=$(jq -r '.cursor_api_key // empty' "$CONFIG_FILE" 2>/dev/null)
-    if [[ -n "$KEY" ]]; then
-      return 0
-    fi
+  
+  local project_config="$WORKSPACE_ROOT/.cursor/ralph-config.json"
+  if [[ -f "$project_config" ]]; then
+    local key=$(jq -r '.cursor_api_key // empty' "$project_config" 2>/dev/null)
+    if [[ -n "$key" ]]; then echo "$key"; return 0; fi
   fi
-  GLOBAL_CONFIG="$HOME/.cursor/ralph-config.json"
-  if [[ -f "$GLOBAL_CONFIG" ]]; then
-    KEY=$(jq -r '.cursor_api_key // empty' "$GLOBAL_CONFIG" 2>/dev/null)
-    if [[ -n "$KEY" ]]; then
-      return 0
-    fi
+  
+  local global_config="$HOME/.cursor/ralph-config.json"
+  if [[ -f "$global_config" ]]; then
+    local key=$(jq -r '.cursor_api_key // empty' "$global_config" 2>/dev/null)
+    if [[ -n "$key" ]]; then echo "$key"; return 0; fi
   fi
+  
   return 1
+}
+
+is_cloud_enabled() {
+  get_api_key > /dev/null 2>&1
 }
 
 # =============================================================================
@@ -108,18 +91,14 @@ is_cloud_enabled() {
 force_commit() {
   cd "$WORKSPACE_ROOT"
   
-  # Check for uncommitted changes
   if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null || [[ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]]; then
-    echo "Uncommitted changes detected, forcing commit..." >&2
-    
+    echo "Committing work..." >&2
     git add -A 2>/dev/null || true
-    git commit -m "ralph: auto-checkpoint at iteration $CURRENT_ITERATION (context: $ALLOCATED_TOKENS tokens)" 2>/dev/null || true
-    git push origin main 2>/dev/null || git push origin HEAD 2>/dev/null || true
-    
-    return 0  # Had uncommitted changes
+    git commit -m "ralph: checkpoint at iteration $CURRENT_ITERATION (turn $TURN_COUNT, ~$ESTIMATED_TOKENS tokens)" 2>/dev/null || true
+    git push origin HEAD 2>/dev/null || true
+    return 0
   fi
-  
-  return 1  # No uncommitted changes
+  return 1
 }
 
 # =============================================================================
@@ -128,21 +107,20 @@ force_commit() {
 
 run_tests() {
   local test_cmd="$1"
-  local workspace="$2"
   
   if [[ -z "$test_cmd" ]]; then
     echo "NO_TEST_COMMAND"
     return 0
   fi
   
-  cd "$workspace"
+  cd "$WORKSPACE_ROOT"
   
   set +e
   TEST_OUTPUT=$(eval "$test_cmd" 2>&1)
   TEST_EXIT_CODE=$?
   set -e
   
-  echo "$TEST_OUTPUT" > "$RALPH_DIR/.last_test_output"
+  echo "$TEST_OUTPUT" > "$EXT_DIR/.last_test_output"
   
   if [[ $TEST_EXIT_CODE -eq 0 ]]; then
     echo "PASS"
@@ -152,44 +130,57 @@ run_tests() {
 }
 
 # =============================================================================
-# DECISION LOGIC
+# LOG THE STOP EVENT
 # =============================================================================
 
-# Log the stop event
-cat >> "$PROGRESS_FILE" <<EOF
+cat >> "$EXT_DIR/progress.md" <<EOF
 
 ---
 
 ### Agent Stopped (Iteration $CURRENT_ITERATION)
 - Time: $TIMESTAMP
 - Status: $STOP_STATUS
-- Context: $ALLOCATED_TOKENS tokens
+- Turns: $TURN_COUNT (~$ESTIMATED_TOKENS tokens)
 - Criteria remaining: $UNCHECKED_CRITERIA
 
 EOF
 
 # =============================================================================
-# CASE 1: Context limit reached - handoff to Cloud Agent
+# CASE 1: Already terminated (shouldn't happen, but handle gracefully)
 # =============================================================================
 
-if [[ "$ALLOCATED_TOKENS" -ge "$THRESHOLD" ]]; then
+if is_terminated "$EXT_DIR"; then
+  echo '{}' 
+  exit 0
+fi
+
+# =============================================================================
+# CASE 2: Context limit reached - handoff to Cloud Agent
+# =============================================================================
+
+if [[ "$ESTIMATED_TOKENS" -ge "$THRESHOLD" ]]; then
   
-  # Force commit any uncommitted work
+  # Force commit FIRST
   force_commit
   
-  cat >> "$PROGRESS_FILE" <<EOF
-**Context limit reached. Initiating handoff...**
+  # Set terminated flag to prevent further prompts
+  set_terminated "$EXT_DIR" "context_limit_$ESTIMATED_TOKENS"
+  
+  cat >> "$EXT_DIR/progress.md" <<EOF
+**Context limit reached ($ESTIMATED_TOKENS tokens). Initiating handoff...**
 
 EOF
   
-  # Update state for next iteration
+  # Prepare for next iteration
   NEXT_ITERATION=$((CURRENT_ITERATION + 1))
-  cat > "$STATE_FILE" <<EOF
+  
+  # Update state for next agent
+  cat > "$EXT_DIR/state.md" <<EOF
 ---
 iteration: $NEXT_ITERATION
 status: handoff_pending
 started_at: $TIMESTAMP
-previous_context: $ALLOCATED_TOKENS
+previous_context: $ESTIMATED_TOKENS
 ---
 
 # Ralph State
@@ -198,45 +189,26 @@ Iteration $NEXT_ITERATION - Awaiting fresh context (handoff from iteration $CURR
 EOF
 
   # Reset context log for next agent
-  cat > "$CONTEXT_LOG" <<EOF
-# Context Allocation Log (Hook-Managed)
-
-> ⚠️ This file is managed by hooks. Do not edit manually.
-
-## Current Session
-
-| File | Size (est tokens) | Timestamp |
-|------|-------------------|-----------|
-
-## Estimated Context Usage
-
-- Allocated: 0 tokens
-- Threshold: $THRESHOLD tokens (warn at 80%)
-- Status: 🟢 Fresh context (handoff from iteration $CURRENT_ITERATION)
-
-EOF
-
+  reset_context "$EXT_DIR" "$CURRENT_ITERATION"
+  
   # Try Cloud Mode
   if is_cloud_enabled; then
-    if "$SCRIPT_DIR/spawn-cloud-agent.sh" "$WORKSPACE_ROOT" 2>/dev/null; then
+    if "$SCRIPT_DIR/spawn-cloud-agent.sh" "$WORKSPACE_ROOT" 2>&1; then
+      # Clear terminated flag since cloud agent will take over
+      clear_terminated "$EXT_DIR"
+      
       jq -n \
         --argjson iter "$NEXT_ITERATION" \
         '{
-          "followup_message": ("🌩️ Context limit reached. Cloud Agent spawned for iteration " + ($iter|tostring) + ". Check the Cursor dashboard for progress.")
+          "followup_message": ("🌩️ Context limit reached. Cloud Agent spawned for iteration " + ($iter|tostring) + ". This conversation is complete.")
         }'
       exit 0
     else
-      # Cloud spawn failed
-      jq -n \
-        --argjson iter "$NEXT_ITERATION" \
-        '{
-          "followup_message": ("⚠️ Context limit reached but Cloud Agent spawn failed. Start a NEW conversation: \"Continue Ralph from iteration " + ($iter|tostring) + "\"")
-        }'
-      exit 0
+      echo "Cloud spawn failed, staying in local mode" >&2
     fi
   fi
   
-  # Local Mode
+  # Local Mode - tell user to start new conversation
   jq -n \
     --argjson iter "$NEXT_ITERATION" \
     '{
@@ -246,20 +218,19 @@ EOF
 fi
 
 # =============================================================================
-# CASE 2: All criteria checked - verify with tests
+# CASE 3: All criteria checked - verify with tests
 # =============================================================================
 
 if [[ "$UNCHECKED_CRITERIA" -eq 0 ]]; then
   
   if [[ -n "$TEST_COMMAND" ]]; then
-    TEST_RESULT=$(run_tests "$TEST_COMMAND" "$WORKSPACE_ROOT")
-    TEST_OUTPUT=$(cat "$RALPH_DIR/.last_test_output" 2>/dev/null || echo "")
+    TEST_RESULT=$(run_tests "$TEST_COMMAND")
+    TEST_OUTPUT=$(cat "$EXT_DIR/.last_test_output" 2>/dev/null || echo "")
     
     if [[ "$TEST_RESULT" == "PASS" ]]; then
-      # Commit final state
       force_commit
       
-      cat >> "$PROGRESS_FILE" <<EOF
+      cat >> "$EXT_DIR/progress.md" <<EOF
 ## 🎉 RALPH COMPLETE (Tests Verified)
 - Test command: $TEST_COMMAND
 - Result: ✅ PASSED
@@ -270,7 +241,7 @@ $TEST_OUTPUT
 
 EOF
       
-      cat > "$STATE_FILE" <<EOF
+      cat > "$EXT_DIR/state.md" <<EOF
 ---
 iteration: $CURRENT_ITERATION
 status: complete
@@ -288,8 +259,8 @@ EOF
       exit 0
       
     else
-      # Tests failed - not actually complete
-      cat >> "$PROGRESS_FILE" <<EOF
+      # Tests failed
+      cat >> "$EXT_DIR/progress.md" <<EOF
 ### ❌ Tests FAILED
 - Test command: $TEST_COMMAND
 - Output:
@@ -304,7 +275,7 @@ EOF
       jq -n \
         --arg output "$TEST_OUTPUT" \
         '{
-          "followup_message": ("⚠️ Criteria are checked but tests FAIL. Task is not complete.\n\nTest output:\n" + $output)
+          "followup_message": ("⚠️ Criteria checked but tests FAIL. Fix the issues.\n\nTest output:\n" + $output)
         }'
       exit 0
     fi
@@ -313,7 +284,7 @@ EOF
     # No test command
     force_commit
     
-    cat > "$STATE_FILE" <<EOF
+    cat > "$EXT_DIR/state.md" <<EOF
 ---
 iteration: $CURRENT_ITERATION
 status: complete
@@ -326,23 +297,22 @@ completed_at: $TIMESTAMP
 EOF
     
     jq -n '{
-      "followup_message": "🎉 Ralph task complete (no test command defined for verification)."
+      "followup_message": "🎉 Ralph task complete (no test command for verification)."
     }'
     exit 0
   fi
 fi
 
 # =============================================================================
-# CASE 3: Normal stop with work remaining
+# CASE 4: Normal stop with work remaining
 # =============================================================================
 
-# Commit any work
 force_commit
 
 jq -n \
   --argjson remaining "$UNCHECKED_CRITERIA" \
   '{
-    "followup_message": ("Agent stopped with " + ($remaining|tostring) + " criteria remaining. Continue working or start a new conversation.")
+    "followup_message": ("Agent stopped with " + ($remaining|tostring) + " criteria remaining. Continue working.")
   }'
 
 exit 0
