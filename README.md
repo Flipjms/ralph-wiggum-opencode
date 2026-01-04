@@ -14,6 +14,19 @@ while :; do cat PROMPT.md | agent ; done
 
 The same prompt is fed repeatedly to an AI agent. Progress persists in **files and git**, not in the LLM's context window. When context fills up, you get a fresh agent with fresh context.
 
+## Prerequisites
+
+Before using Ralph, you need:
+
+| Requirement | Check | How to Set Up |
+|-------------|-------|---------------|
+| **Git repo** | `git status` works | `git init` |
+| **GitHub remote** | `git remote -v` shows origin | Push to GitHub first |
+| **GitHub connected to Cursor** | Can use Cloud Agents in Cursor | Cursor Settings → GitHub → Connect |
+| **Cursor API Key** | For Cloud Agent API | [cursor.com/dashboard](https://cursor.com/dashboard?tab=integrations) |
+
+**Important:** Cloud Agents work on **existing GitHub repositories**. Ralph does not create repos for you.
+
 ## Two Modes
 
 ### 🌩️ Cloud Loop (Recommended)
@@ -36,26 +49,64 @@ Best for: Interactive work where you want hands-on control initially
 
 ## Quick Start (Cloud Loop)
 
-### 1. Install
+### 1. Set Up Your Project
 
 ```bash
+# Must be a git repo with GitHub remote
 cd your-project
+git status          # Should work
+git remote -v       # Should show github.com
+
+# If not set up yet:
+git init
+git add -A
+git commit -m "initial"
+gh repo create my-project --private --source=. --push
+# Or create repo on GitHub and: git remote add origin https://github.com/you/repo && git push -u origin main
+```
+
+### 2. Install Ralph
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/agrimsingh/ralph-wiggum-cursor/main/install.sh | bash
 ```
 
-### 2. Configure API Key
+This creates:
+```
+your-project/
+├── .cursor/
+│   ├── hooks.json              # Cursor hooks config
+│   └── ralph-scripts/          # All Ralph scripts
+├── .ralph/                     # Synced state (for Cloud Agents)
+│   ├── progress.md
+│   └── guardrails.md
+└── RALPH_TASK.md               # Your task definition
+
+~/.cursor/ralph/<project-hash>/ # External state (tamper-proof)
+├── state.md
+├── context-log.md
+├── progress.md
+├── guardrails.md
+└── ...
+```
+
+### 3. Configure Cursor API Key
 
 Get your key from [cursor.com/dashboard](https://cursor.com/dashboard?tab=integrations)
 
 ```bash
 # Option A: Environment variable
-export CURSOR_API_KEY='your-key'
+export CURSOR_API_KEY='key_xxx'
 
-# Option B: Config file (persists)
-echo '{"cursor_api_key": "your-key"}' > ~/.cursor/ralph-config.json
+# Option B: Config file (recommended - persists across sessions)
+cat > ~/.cursor/ralph-config.json << 'EOF'
+{
+  "cursor_api_key": "key_xxx"
+}
+EOF
 ```
 
-### 3. Define Your Task
+### 4. Define Your Task
 
 Edit `RALPH_TASK.md`:
 
@@ -74,121 +125,71 @@ test_command: "npm test"
 3. [ ] Tests pass
 ```
 
-### 4. Start the Loop
+**Important:** Use `[ ]` checkboxes. Ralph tracks completion by counting unchecked boxes.
+
+### 5. Test API Connection (Optional)
 
 ```bash
-./scripts/ralph-loop.sh
+./.cursor/ralph-scripts/test-cloud-api.sh
+```
+
+### 6. Start the Loop
+
+```bash
+./.cursor/ralph-scripts/ralph-loop.sh
 ```
 
 Ralph will:
-1. Spawn a Cloud Agent
-2. Watch it work
-3. When it finishes, check if task is complete
-4. If not, spawn another agent
-5. Repeat until all `[ ]` are `[x]`
+1. Show task summary and ask for confirmation
+2. Commit any uncommitted work
+3. Spawn Cloud Agent 1
+4. Poll status every 30s
+5. When agent finishes, check if task is complete
+6. If incomplete, spawn another agent
+7. Repeat until all `[ ]` are `[x]` (or max 10 agents)
 
 ---
 
 ## Quick Start (Local + Handoff)
 
-### 1. Install
+### 1-4. Same as Above
 
-```bash
-cd your-project
-curl -fsSL https://raw.githubusercontent.com/agrimsingh/ralph-wiggum-cursor/main/install.sh | bash
-```
+Install, configure API key, define task.
 
-### 2. Configure (Optional for Local-Only)
+### 5. Restart Cursor
 
-For automatic Cloud handoff, configure your API key (see above).
+Hooks only load on Cursor startup.
 
-### 3. Work in Cursor
+### 6. Work in Cursor
 
-1. Open the project in Cursor
-2. **Restart Cursor** (to load hooks)
-3. Start a conversation: *"Work on the Ralph task in RALPH_TASK.md"*
+Start a conversation:
+> "Work on the Ralph task in RALPH_TASK.md"
 
-### 4. Context Limit Handoff
+### 7. Automatic Handoff
 
 When context fills up (~60k tokens):
 - Hooks block further prompts
-- Stop hook commits your work
+- Work is committed and pushed
 - Cloud Agent is spawned automatically
-- You can watch it: `./scripts/watch-cloud-agent.sh <agent-id>`
+- Message tells you to start a new conversation (or watch the cloud agent)
 
----
-
-## How It Works
-
-### The malloc/free Problem
-
-> "When data is `malloc()`'ed into the LLM's context window, it cannot be `free()`'d unless you create a brand new context window."
-
-LLM context is like memory:
-- Reading files, tool outputs, conversation = `malloc()`
-- **There is no `free()`**
-- Only way to free: start a new conversation/agent
-
-### Architecture
-
-```
-External State (tamper-proof)          Workspace
-~/.cursor/ralph/<hash>/                
-├── state.md                           RALPH_TASK.md (your task)
-├── context-log.md                     .ralph/
-├── progress.md          ◄── synced ── ├── progress.md
-├── guardrails.md        ◄── synced ── └── guardrails.md
-└── .terminated                        
-```
-
-State is stored **outside the workspace** so agents can't tamper with tracking.
-
-### Cloud Loop Flow
-
-```
-ralph-loop.sh
-     │
-     ├─► Spawn Cloud Agent 1
-     │        │
-     │        ▼
-     │   Agent works on task
-     │        │
-     │        ▼
-     │   Agent finishes
-     │        │
-     │   ┌────┴────┐
-     │   │         │
-     │   ▼         ▼
-     │ Complete?  Incomplete?
-     │   │         │
-     │   ▼         ▼
-     │  Done!    Spawn Agent 2
-     │             │
-     └─────────────┘ (repeat up to 10x)
-```
-
-### Local Handoff Flow
-
-```
-You in Cursor ──► work ──► context fills ──► hook blocks
-                                                  │
-                                                  ▼
-                                          spawn Cloud Agent
-                                                  │
-                                                  ▼
-                                          (optionally watch)
+To watch the spawned agent:
+```bash
+./.cursor/ralph-scripts/watch-cloud-agent.sh bc-xxx-agent-id
 ```
 
 ---
 
-## Commands
+## File Locations
 
-| Command | Description |
-|---------|-------------|
-| `./scripts/ralph-loop.sh` | Start autonomous cloud loop |
-| `./scripts/watch-cloud-agent.sh <id>` | Watch and chain a specific agent |
-| `./scripts/spawn-cloud-agent.sh` | Manually spawn a cloud agent |
-| `./scripts/test-cloud-api.sh` | Test API connectivity |
+| Location | Purpose | Who Uses It |
+|----------|---------|-------------|
+| `RALPH_TASK.md` | Task definition | You define, agents read |
+| `.ralph/` | Synced state | Cloud Agents read this |
+| `~/.cursor/ralph/<hash>/` | External state | Hooks read/write (tamper-proof) |
+| `~/.cursor/ralph-config.json` | API keys | Scripts read |
+| `.cursor/hooks.json` | Hook config | Cursor reads |
+| `.cursor/ralph-scripts/` | Scripts | You run / hooks run |
 
 ---
 
@@ -202,6 +203,11 @@ You in Cursor ──► work ──► context fills ──► hook blocks
   "github_token": "ghp_xxx"
 }
 ```
+
+| Key | Required | Purpose |
+|-----|----------|---------|
+| `cursor_api_key` | **Yes** for Cloud | Cloud Agent API authentication |
+| `github_token` | No | Optional: for local git push auth |
 
 ### `RALPH_TASK.md` Format
 
@@ -221,7 +227,68 @@ max_iterations: 20                 # Optional: safety limit
 3. [ ] Third thing to complete
 ```
 
-**Important:** Use `[ ]` checkboxes. Ralph tracks completion by counting unchecked boxes.
+---
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `./.cursor/ralph-scripts/ralph-loop.sh` | Start autonomous cloud loop |
+| `./.cursor/ralph-scripts/watch-cloud-agent.sh <id>` | Watch and chain a specific agent |
+| `./.cursor/ralph-scripts/spawn-cloud-agent.sh` | Manually spawn a cloud agent |
+| `./.cursor/ralph-scripts/test-cloud-api.sh` | Test API connectivity |
+
+---
+
+## How It Works
+
+### The malloc/free Problem
+
+LLM context is like memory:
+- Reading files, tool outputs, conversation = `malloc()`
+- **There is no `free()`**
+- Only way to free: start a new conversation/agent
+
+### Cloud Loop Flow
+
+```
+ralph-loop.sh
+     │
+     ├─► Commit & push local changes
+     │
+     ├─► Spawn Cloud Agent 1
+     │        │
+     │        ▼
+     │   Agent works (fresh context)
+     │        │
+     │        ▼
+     │   Agent finishes
+     │        │
+     │   ┌────┴────────┐
+     │   │             │
+     │   ▼             ▼
+     │ All [x]?      Still [ ]?
+     │   │             │
+     │   ▼             ▼
+     │  Done!     Spawn Agent 2
+     │                 │
+     └─────────────────┘ (repeat up to 10x)
+```
+
+### Local Handoff Flow
+
+```
+You in Cursor ──► work ──► ~60k tokens ──► hooks block
+                                               │
+                                               ▼
+                                         commit & push
+                                               │
+                                               ▼
+                                        spawn Cloud Agent
+                                               │
+                                               ▼
+                                    (watch with watch-cloud-agent.sh)
+```
 
 ---
 
@@ -236,56 +303,65 @@ When Ralph makes mistakes, add "signs" to `.ralph/guardrails.md`:
 - **Added after**: Iteration 3 - SQL injection
 ```
 
-Signs are injected into agent context to prevent repeated mistakes.
+Signs are synced to cloud agents to prevent repeated mistakes.
 
 ---
 
-## Monitoring
-
-### Check Agent Status
+## Monitoring Cloud Agents
 
 ```bash
+# Check status
 curl -s "https://api.cursor.com/v0/agents/<id>" \
-  -u "$CURSOR_API_KEY:" | jq .
-```
+  -u "$CURSOR_API_KEY:" | jq '{status, name, summary}'
 
-### View Agent Conversation
-
-```bash
+# View conversation
 curl -s "https://api.cursor.com/v0/agents/<id>/conversation" \
   -u "$CURSOR_API_KEY:" | jq '.messages[-3:]'
-```
 
-### List Your Agents
-
-```bash
+# List all your agents
 curl -s "https://api.cursor.com/v0/agents" \
   -u "$CURSOR_API_KEY:" | jq '.agents[] | {id, status, name}'
 ```
+
+Or visit: `https://cursor.com/agents?id=<agent-id>`
 
 ---
 
 ## Troubleshooting
 
-### "No RALPH_TASK.md found"
+### "Could not determine repository URL"
 
-Create a task file in your project root.
+Your project needs a GitHub remote:
+```bash
+git remote add origin https://github.com/you/repo
+git push -u origin main
+```
+
+### "Branch does not exist"
+
+The source branch must exist on GitHub. Push your current branch:
+```bash
+git push origin HEAD
+```
 
 ### "No API key configured"
 
 ```bash
-export CURSOR_API_KEY='your-key'
-# or
-echo '{"cursor_api_key": "key"}' > ~/.cursor/ralph-config.json
+echo '{"cursor_api_key": "key_xxx"}' > ~/.cursor/ralph-config.json
 ```
 
-### Agent stuck on same issue
+### Hooks not firing in Cursor
 
-Add a guardrail to `.ralph/guardrails.md` explaining what to do differently.
+1. Check `.cursor/hooks.json` exists
+2. Restart Cursor completely
+3. Check Cursor Settings → Hooks tab for errors
 
-### Hooks not firing
+### Cloud Agent can't access repo
 
-Restart Cursor after installing. Check `.cursor/hooks.json` exists.
+Make sure GitHub is connected to Cursor:
+1. Cursor Settings → GitHub
+2. Connect your GitHub account
+3. Grant access to the repository
 
 ---
 
