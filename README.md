@@ -310,6 +310,11 @@ Check if criteria are too vague. Each criterion should be:
 - [Context as memory](https://ghuntley.com/allocations/) - The malloc/free metaphor
 - [Cursor CLI docs](https://cursor.com/docs/cli/headless)
 
+## Credits
+
+- **Original technique**: [Geoffrey Huntley](https://ghuntley.com/ralph/) - the Ralph Wiggum methodology
+- **Cursor port**: [Agrim Singh](https://x.com/agrimsingh) - this implementation
+
 ## License
 
 MIT
