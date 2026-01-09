@@ -1,6 +1,6 @@
-# Ralph Wiggum for Cursor
+# Ralph Wiggum for Opencode
 
-An implementation of [Geoffrey Huntley's Ralph Wiggum technique](https://ghuntley.com/ralph/) for Cursor, enabling autonomous AI development with deliberate context management.
+An implementation of [Geoffrey Huntley's Ralph Wiggum technique](https://ghuntley.com/ralph/) for Opencode, enabling autonomous AI development with deliberate context management.
 
 > "That's the beauty of Ralph - the technique is deterministically bad in an undeterministic world."
 
@@ -39,7 +39,7 @@ This creates two problems:
 │                      ralph-loop.sh                           │
 │                           │                                  │
 │                           ▼                                  │
-│    cursor-agent -p --force --output-format stream-json       │
+│                opencode run --format json                    │
 │                           │                                  │
 │                           ▼                                  │
 │                   stream-parser.sh                           │
@@ -53,7 +53,7 @@ This creates two problems:
 │  ├── progress.md   (agent writes)          └── GUTTER       │
 │  └── guardrails.md (lessons learned)                        │
 │                                                              │
-│  When ROTATE → cursor-agent --resume (fresh context)        │
+│  When ROTATE → opencode run --session (fresh context)       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -68,7 +68,7 @@ This creates two problems:
 | Requirement | Check | How to Set Up |
 |-------------|-------|---------------|
 | **Git repo** | `git status` works | `git init` |
-| **cursor-agent CLI** | `which cursor-agent` | `curl https://cursor.com/install -fsS \| bash` |
+| **opencode CLI** | `which opencode` | `curl https://opencode.ai/install -fsS \| bash` |
 
 ## Quick Start
 
@@ -76,13 +76,13 @@ This creates two problems:
 
 ```bash
 cd your-project
-curl -fsSL https://raw.githubusercontent.com/agrimsingh/ralph-wiggum-cursor/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/agrimsingh/ralph-wiggum-opencode/main/install.sh | bash
 ```
 
 This creates:
 ```
 your-project/
-├── .cursor/ralph-scripts/      # Ralph scripts
+├── .opencode/ralph-scripts/      # Ralph scripts
 │   ├── ralph-loop.sh           # Main entry point
 │   ├── stream-parser.sh        # Token tracking
 │   ├── ralph-common.sh         # Shared config
@@ -127,12 +127,12 @@ Build a REST API with user management.
 ### 3. Start the Loop
 
 ```bash
-./.cursor/ralph-scripts/ralph-loop.sh
+./.opencode/ralph-scripts/ralph-loop.sh
 ```
 
 Ralph will:
 1. Show task summary and ask for confirmation
-2. Run `cursor-agent` with your task
+2. Run `opencode` with your task
 3. Parse output in real-time, tracking token usage
 4. At 70k tokens: warn agent to wrap up current work
 5. At 80k tokens: rotate to fresh context
@@ -260,7 +260,7 @@ When gutter is detected:
 
 ## Configuration
 
-Edit thresholds in `.cursor/ralph-scripts/ralph-loop.sh`:
+Edit thresholds in `.opencode/ralph-scripts/ralph-loop.sh`:
 
 ```bash
 MAX_ITERATIONS=20       # Max rotations before giving up
@@ -272,17 +272,17 @@ ROTATE_THRESHOLD=80000  # Tokens: force rotation
 
 | Command | Description |
 |---------|-------------|
-| `./.cursor/ralph-scripts/ralph-loop.sh` | Start autonomous loop |
-| `./.cursor/ralph-scripts/ralph-loop.sh /path/to/project` | Start loop in specific project |
-| `./.cursor/ralph-scripts/init-ralph.sh` | Re-initialize Ralph state |
+| `./.opencode/ralph-scripts/ralph-loop.sh` | Start autonomous loop |
+| `./.opencode/ralph-scripts/ralph-loop.sh /path/to/project` | Start loop in specific project |
+| `./.opencode/ralph-scripts/init-ralph.sh` | Re-initialize Ralph state |
 | `tail -f .ralph/activity.log` | Monitor progress in real-time |
 
 ## Troubleshooting
 
-### "cursor-agent CLI not found"
+### "opencode CLI not found"
 
 ```bash
-curl https://cursor.com/install -fsS | bash
+curl https://opencode.ai/install -fsS | bash
 ```
 
 ### Agent keeps failing on same thing
@@ -308,12 +308,12 @@ Check if criteria are too vague. Each criterion should be:
 
 - [Original Ralph technique](https://ghuntley.com/ralph/) - Geoffrey Huntley
 - [Context as memory](https://ghuntley.com/allocations/) - The malloc/free metaphor
-- [Cursor CLI docs](https://cursor.com/docs/cli/headless)
+- [Opencode CLI docs](https://opencode.ai/docs/cli)
 
 ## Credits
 
 - **Original technique**: [Geoffrey Huntley](https://ghuntley.com/ralph/) - the Ralph Wiggum methodology
-- **Cursor port**: [Agrim Singh](https://x.com/agrimsingh) - this implementation
+- **Opencode port**: [Agrim Singh](https://x.com/agrimsingh) - this implementation
 
 ## License
 

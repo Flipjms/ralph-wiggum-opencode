@@ -1,6 +1,6 @@
-# Ralph Wiggum Cursor Skill: Git Workflow for Cloud Mode
+# Ralph Wiggum Opencode Skill: Git Workflow for Cloud Mode
 
-This document outlines the git branching and merging strategy when using the Ralph Wiggum Cursor Skill in **Cloud Mode**. Understanding this workflow is crucial for seamless collaboration between your local environment and the automated Cloud Agents.
+This document outlines the git branching and merging strategy when using the Ralph Wiggum Opencode Skill in **Cloud Mode**. Understanding this workflow is crucial for seamless collaboration between your local environment and the automated Cloud Agents.
 
 ## Core Concepts
 
@@ -13,7 +13,7 @@ The process is a loop of local work, automated handoff, cloud-based work, and ma
 
 ### 1. Local Development (on `main`)
 
--   You begin the task by working in your local Cursor environment on the `main` branch.
+-   You begin the task by working in your local Opencode environment on the `main` branch.
 -   You use the Ralph skill, which tracks context usage via its hooks (`beforeSubmitPrompt`, `beforeReadFile`, etc.).
 -   You commit your changes to `main` as you make progress.
 
@@ -21,7 +21,7 @@ The process is a loop of local work, automated handoff, cloud-based work, and ma
 
 -   When the `stop-hook` detects that the context limit has been reached (a "gutter" situation), it triggers the `spawn-cloud-agent.sh` script.
 -   **Crucially, this script first commits any uncommitted local changes to your current branch (`main`) and force-pushes them to the remote origin.** This ensures the Cloud Agent starts with the absolute latest version of your work.
--   The script then calls the Cursor API to spawn a new Cloud Agent.
+-   The script then calls the Opencode API to spawn a new Cloud Agent.
 -   The new agent is instructed to:
     -   Check out the `main` branch.
     -   Create a new branch named `ralph-iteration-N` (e.g., `ralph-iteration-1`).

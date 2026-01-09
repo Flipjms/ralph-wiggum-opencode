@@ -2,7 +2,7 @@
 name: ralph-wiggum
 description: Implements the Ralph Wiggum autonomous iteration technique with deliberate context management. Use when building greenfield projects, iterating on well-defined tasks, or when continuous autonomous development is needed. Manages context like memory - tracks allocations, prevents redlining, and knows when to start fresh.
 license: MIT
-compatibility: Designed for Cursor (nightly). Requires bash, jq, git.
+compatibility: Designed for Opencode. Requires bash, jq, git.
 metadata:
   author: Based on Geoffrey Huntley's Ralph technique
   version: "1.0.0"
@@ -100,7 +100,7 @@ Build a task management API with the following endpoints:
 - Follow REST conventions
 ```
 
-Then tell Cursor: "Start a Ralph loop on this task"
+Then tell Opencode: "Start a Ralph loop on this task"
 
 ### Monitoring Progress
 
@@ -151,9 +151,9 @@ Progress is in files and git, not in your head or the context.
 
 Don't hesitate to start fresh. State persists in files.
 
-## Integration with Cursor Hooks
+## Integration with Opencode Hooks
 
-This skill uses Cursor hooks for:
+This skill uses Opencode hooks for:
 
 - **beforeSubmitPrompt**: Inject guardrails and context awareness
 - **beforeReadFile**: Track context allocations

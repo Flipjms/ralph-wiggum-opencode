@@ -99,7 +99,7 @@ The original Ralph technique (`while :; do cat PROMPT.md | agent ; done`) natura
 3. **Same prompt each time** - Focused, single-task context
 4. **Failures inform guardrails** - Learning without context pollution
 
-This Cursor implementation aims to bring these benefits while working within Cursor's session model.
+This Opencode implementation aims to bring these benefits while working within Opencode's session model.
 
 ## Measuring Context
 

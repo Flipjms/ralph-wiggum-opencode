@@ -1,0 +1,4 @@
+.idea
+
+# Ralph config (may contain API keys)
+.opencode/ralph-config.json
